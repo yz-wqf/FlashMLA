@@ -11,12 +11,13 @@ Template parameters:
 
 Grid: [s_q, 1, 1]
 
-#if FLASH_MLA_SMALL_HEADS
-I/O: See SparseAttnSmallHeadsFwdParams in kernels/params.h
-#else // FLASH_MLA_SMALL_HEADS
-I/O: See SparseAttnFwdParams in kernels/params.h
-#endif // FLASH_MLA_SMALL_HEADS
+I/O: See KernelParams in config.h (SparseAttnFwdParams, SparseAttnSmallHeadsFwdParams or
+SparseAttnExtraKvFwdParams in kernels/params.h, depending on the wrapper)
 */
+
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
 
 #include <math_constants.h>
 #include <cute/tensor.hpp>
@@ -31,11 +32,23 @@ I/O: See SparseAttnFwdParams in kernels/params.h
 #include "kernels/sm100/helpers.h"
 #include "kernels/sm100/common_subroutine.h"
 
-#if FLASH_MLA_SMALL_HEADS
+#if FLASH_MLA_EXTRA_KV && FLASH_MLA_SMALL_HEADS && FLASH_MLA_TARGET == 107
+namespace legacy::sm100::prefill::sparse_fwd::extra_kv::small_heads_sm107 {
+#elif FLASH_MLA_EXTRA_KV && FLASH_MLA_SMALL_HEADS
+namespace legacy::sm100::prefill::sparse_fwd::extra_kv::small_heads {
+#elif FLASH_MLA_EXTRA_KV && FLASH_MLA_TARGET == 107
+namespace legacy::sm100::prefill::sparse_fwd::extra_kv::head64_sm107 {
+#elif FLASH_MLA_EXTRA_KV
+namespace legacy::sm100::prefill::sparse_fwd::extra_kv::head64 {
+#elif FLASH_MLA_SMALL_HEADS && FLASH_MLA_TARGET == 107
+namespace legacy::sm100::prefill::sparse_fwd::small_heads_sm107 {
+#elif FLASH_MLA_SMALL_HEADS
 namespace legacy::sm100::prefill::sparse_fwd::small_heads {
-#else // FLASH_MLA_SMALL_HEADS
+#elif FLASH_MLA_TARGET == 107
+namespace legacy::sm100::prefill::sparse_fwd::head64_sm107 {
+#else
 namespace legacy::sm100::prefill::sparse_fwd::head64 {
-#endif // FLASH_MLA_SMALL_HEADS
+#endif
 
 using namespace cute;
 #if FLASH_MLA_SMALL_HEADS
@@ -112,14 +125,147 @@ KV5                 scale(O) w.r.t P3
 
 using FwdMode = SparseAttnFwdMode;
 
-template<FwdMode FWD_MODE, int D_QK>
+/*
+Where the KV tiles come from.
+
+The KV loop runs over global tile indices k = 0 .. num_k_blocks-1. Only the three KV-side
+producers (the K-NoPE TMA gather, the K-valid mask and the K-RoPE cp.async warps) need to
+know where tile k lives; the MMA and softmax consumers see k alone. Without an extra KV cache,
+tile k is indices[k*B_TOPK .. (k+1)*B_TOPK) of params.kv. With FLASH_MLA_EXTRA_KV, the loop first
+covers the main cache's tiles (kv / indices) and then the extra cache's (extra_kv / extra_indices),
+so pipeline phases and the online softmax simply continue across the boundary.
+*/
+#if FLASH_MLA_EXTRA_KV
+// Main-cache positions query s_q_idx attends to: params.topk_length[s_q_idx] if given, clamped to [0, topk]
+CUTE_DEVICE
+int get_main_topk_length(const KernelParams &params, int s_q_idx) {
+    int length = params.topk_length != nullptr ? __ldg(params.topk_length + s_q_idx) : params.topk;
+    return min(max(length, 0), params.topk);
+}
+
+// Extra-cache positions query s_q_idx attends to: params.extra_topk_length[s_q_idx] if given, clamped to [0, extra_topk]
+CUTE_DEVICE
+int get_extra_topk_length(const KernelParams &params, int s_q_idx) {
+    int length = params.extra_topk_length != nullptr ? __ldg(params.extra_topk_length + s_q_idx) : params.extra_topk;
+    return min(max(length, 0), params.extra_topk);
+}
+#endif
+
+struct KvTile {
+    bf16* kv;           // Base of the cache that holds this tile
+    int* indices;       // This tile's B_TOPK indices
+    int s_kv;           // Slots in that cache; valid indices are in [0, s_kv)
+    int stride_kv;      // Row stride of that cache, in elements
+    int pos_start;      // Position of indices[0] within that cache's top-k list
+    int topk_length;    // Positions at or past this within that cache's list are masked out
+#if FLASH_MLA_EXTRA_KV
+    bool is_extra;
+#endif
+};
+
+template<int B_TOPK, bool HAVE_TOPK_LENGTH = false>
+struct KvTileSource {
+    const KernelParams &params;
+    int* indices;       // This query's row of params.indices
+#if FLASH_MLA_EXTRA_KV
+    int* extra_indices;     // This query's row of params.extra_indices
+    int main_topk_length;   // With HAVE_TOPK_LENGTH: main-cache positions at or past this are masked out
+    int extra_topk_length;  // With HAVE_TOPK_LENGTH: extra-cache positions at or past this are masked out
+    int num_main_tiles;
+#else
+    int topk_length;
+#endif
+
+    CUTE_DEVICE
+    KvTileSource(const KernelParams &params, int s_q_idx, int topk_length):
+#if FLASH_MLA_EXTRA_KV
+        params(params), indices(params.indices + s_q_idx*params.stride_indices_s_q),
+        extra_indices(params.extra_indices + s_q_idx*params.stride_extra_indices_s_q),
+        main_topk_length(HAVE_TOPK_LENGTH ? get_main_topk_length(params, s_q_idx) : 0),
+        extra_topk_length(HAVE_TOPK_LENGTH ? get_extra_topk_length(params, s_q_idx) : 0),
+        num_main_tiles(HAVE_TOPK_LENGTH ? cute::ceil_div(main_topk_length, B_TOPK) : params.topk / B_TOPK) {}
+#else
+        params(params), indices(params.indices + s_q_idx*params.stride_indices_s_q), topk_length(topk_length) {}
+#endif
+
+    CUTE_DEVICE
+    KvTile get(int k) const {
+#if FLASH_MLA_EXTRA_KV
+        // Row pointers and the main-cache tile count are computed once per job. Per tile there is
+        // one compare plus branch-free per-field selects, which keeps the producers' per-tile
+        // dependency chain short (it is on the critical path when KV is L2-resident).
+        bool is_extra = k >= num_main_tiles;
+        int tile_idx = is_extra ? k - num_main_tiles : k;
+        return KvTile{is_extra ? params.extra_kv : params.kv,
+                      (is_extra ? extra_indices : indices) + tile_idx*B_TOPK,
+                      is_extra ? params.extra_s_kv : params.s_kv,
+                      is_extra ? params.stride_extra_kv_s_kv : params.stride_kv_s_kv,
+                      tile_idx*B_TOPK,
+                      HAVE_TOPK_LENGTH ? (is_extra ? extra_topk_length : main_topk_length)
+                                       : (is_extra ? params.extra_topk : params.topk),
+                      is_extra};
+#else
+        return {params.kv, indices + k*B_TOPK, params.s_kv, params.stride_kv_s_kv, k*B_TOPK, topk_length};
+#endif
+    }
+};
+
+// Number of top-k positions the KV loop covers for query s_q_idx (with an extra KV cache: whole main-cache
+// tiles, then whole extra-cache tiles)
+template<int B_TOPK, bool HAVE_TOPK_LENGTH>
+CUTE_DEVICE
+int get_topk_length(const KernelParams &params, int s_q_idx) {
+#if FLASH_MLA_EXTRA_KV
+    if constexpr (HAVE_TOPK_LENGTH) {
+        return cute::ceil_div(get_main_topk_length(params, s_q_idx), B_TOPK)*B_TOPK
+             + cute::ceil_div(get_extra_topk_length(params, s_q_idx), B_TOPK)*B_TOPK;
+    } else {
+        return params.topk + params.extra_topk;
+    }
+#else
+    return params.topk_length != nullptr ? __ldg(params.topk_length + s_q_idx) : params.topk;
+#endif
+}
+
+template<typename TmaParam>
+CUTE_DEVICE
+const CUtensorMap* get_kv_nope_tensor_map(const TmaParam &tma_params, const KvTile &tile) {
+#if FLASH_MLA_EXTRA_KV
+    return tile.is_extra ? &(tma_params.tensor_map_extra_kv_nope) : &(tma_params.tensor_map_kv_nope);
+#else
+    return &(tma_params.tensor_map_kv_nope);
+#endif
+}
+
+// TMA descriptor for the NoPE part of one KV cache; tma_gather4 fetches 64-column boxes of it
+static CUtensorMap make_kv_nope_tensor_map(bf16* kv, int s_kv, int stride_kv_s_kv, int d_v) {
+    CUtensorMap tensor_map;
+    uint64_t size[2] = {(uint64_t)d_v, (unsigned long)s_kv};
+    uint64_t stride[1] = {stride_kv_s_kv*sizeof(bf16)};
+    uint32_t box_size[2] = {64, 1};
+    uint32_t elem_stride[2] = {1, 1};
+    CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+        &tensor_map,
+        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2,
+        kv,
+        size,
+        stride,
+        box_size,
+        elem_stride,
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+    KU_ASSERT(res == CUresult::CUDA_SUCCESS);
+    return tensor_map;
+}
+
+template<FwdMode FWD_MODE, int D_QK, bool HAVE_TOPK_LENGTH_>
 template<typename TmaParam>
 __device__ void
-#if FLASH_MLA_SMALL_HEADS
-KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnSmallHeadsFwdParams &params, const TmaParam &tma_params) {
-#else // FLASH_MLA_SMALL_HEADS
-KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params, const TmaParam &tma_params) {
-#endif // FLASH_MLA_SMALL_HEADS
+KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::sparse_attn_fwd_kernel_devfunc(const KernelParams &params, const TmaParam &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     // Grid shape: [s_q, 1, 1]
 
@@ -158,6 +304,9 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
         cute::prefetch_tma_descriptor(tma_params.tma_Q_nope.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_O.get_tma_descriptor());
         cute::prefetch_tma_descriptor(&(tma_params.tensor_map_kv_nope));
+#if FLASH_MLA_EXTRA_KV
+        cute::prefetch_tma_descriptor(&(tma_params.tensor_map_extra_kv_nope));
+#endif
 
         plan.bar_prologue_q_nope.init(1);
         plan.bar_prologue_utccp_nope.init(1);
@@ -195,8 +344,16 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
         plan.bar_so_ready.init(128);
 #endif // FLASH_MLA_SMALL_HEADS
         if constexpr (HAVE_ROPE) {
+#if FLASH_MLA_TARGET == 107
+            CUTE_UNROLL
+            for (int i = 0; i < NUM_ROPE_BUFS; ++i) {
+                plan.bar_qk_rope_done[i].init(1);
+                plan.bar_kv_rope_ready[i].init(64);
+            }
+#else
             plan.bar_qk_rope_done.init(1);
             plan.bar_kv_rope_ready.init(64);
+#endif
         }
 #if FLASH_MLA_SMALL_HEADS
         plan.bar_o_write_back_done.init(64);
@@ -224,7 +381,11 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
     auto issue_q_rope_tma = [&](int s_q_idx) {
         if constexpr (HAVE_ROPE) {
             Tensor gQ_rope = tma_params.tma_Q_rope.get_tma_tensor(tma_params.shape_Q_rope)(_, _, s_q_idx);
+#if FLASH_MLA_TARGET == 107
+            Tensor sQ_rope = make_tensor(make_smem_ptr(plan.q_rope_slot), SmemLayoutQRoPE{});
+#else
             Tensor sQ_rope = make_tensor(make_smem_ptr(plan.qk_rope_slot), SmemLayoutQRoPE{});
+#endif
             ku::launch_tma_copy(tma_params.tma_Q_rope, gQ_rope, sQ_rope, plan.bar_prologue_q_rope, TMA::CacheHintSm90::EVICT_FIRST);
         }
     };
@@ -237,7 +398,11 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
 
             UMMA::SmemDescriptor sQ_rope_desc = UMMA::make_umma_desc<UMMA::Major::K>(
                 make_tensor(
+#if FLASH_MLA_TARGET == 107
+                    make_smem_ptr(plan.q_rope_slot),
+#else
                     make_smem_ptr(plan.qk_rope_slot),
+#endif
                     tile_to_shape(
                         UMMA::Layout_K_SW64_Atom<bf16>{},
                         Shape<Int<B_H*2>, Int<32>>{}
@@ -254,7 +419,9 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                     tmem_cols::Q_RoPE + subtile_idx*8
                 );
             }
+#if FLASH_MLA_TARGET != 107
             ku::umma_arrive_noelect(plan.bar_prologue_utccp_rope);
+#endif  // The sm_107 copy stages Q RoPE in its own slot, so no K RoPE load waits for this UTCCP
         }
     };
 
@@ -299,7 +466,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
         CUTE_NO_UNROLL
         while (next_job.is_valid) {
             int s_q_idx = next_job.x;
-            int topk_length = params.topk_length != nullptr ? __ldg(params.topk_length + s_q_idx) : params.topk;
+            int topk_length = get_topk_length<B_TOPK, HAVE_TOPK_LENGTH>(params, s_q_idx);
             int num_k_blocks = max(cute::ceil_div(topk_length, (int)B_TOPK), 2);  // num_k_blocks always >= 2 to simplify synchronizations across outer loop boundries
             OuterloopArgs args = {
                 (bool)outer_loop_phase,
@@ -606,18 +773,19 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
         constexpr int NUM_WARPS = 4, NUM_LOCAL_ROWS_PER_WARP = (B_TOPK/4)/NUM_WARPS;
         run_outer_loop([&](const OuterloopArgs &args) {
             if (elect_one_sync()) {
-                int* gIndices = params.indices + args.s_q_idx*params.stride_indices_s_q; // [topk]
+                KvTileSource<B_TOPK, HAVE_TOPK_LENGTH> kv_tiles(params, args.s_q_idx, args.topk_length);
                 CUTE_NO_UNROLL
                 for (int k = 0; k < args.num_k_blocks; ++k) {
+                    KvTile kv_tile = kv_tiles.get(k);
                     int4 indices[NUM_LOCAL_ROWS_PER_WARP];
-                    int max_indices = -1, min_indices = params.s_kv;
+                    int max_indices = -1, min_indices = kv_tile.s_kv;
                     CUTE_UNROLL
                     for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
-                        indices[local_row] = __ldg((int4*)(gIndices + k*B_TOPK) + local_row*NUM_WARPS + warp_idx);
+                        indices[local_row] = __ldg((int4*)kv_tile.indices + local_row*NUM_WARPS + warp_idx);
                         max_indices = max(max_indices, int4_max(indices[local_row]));
                         min_indices = min(min_indices, int4_min(indices[local_row]));
                     }
-                    bool is_all_rows_invalid = min_indices == params.s_kv || max_indices == -1;
+                    bool is_all_rows_invalid = min_indices == kv_tile.s_kv || max_indices == -1;
                     bool should_skip_tma = is_all_rows_invalid && k >= NUM_BUFS;    // Don't skip TMA for the first NUM_BUFS turns to swipe out invalid values in kv buffer
 
                     if (k == 1) {
@@ -639,7 +807,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                             CUTE_UNROLL
                             for (int local_col = part_idx*(D_V/2/64); local_col < (part_idx+1)*(D_V/2/64); ++local_col) {
                                 ku::tma_gather4(
-                                    &(tma_params.tensor_map_kv_nope),
+                                    get_kv_nope_tensor_map(tma_params, kv_tile),
                                     plan.bar_kv_nope_ready[buf_idx][part_idx],
                                     sK_nope_base + local_row*(4*NUM_WARPS)*64 + local_col*(B_TOPK*64),
                                     local_col*64,
@@ -696,13 +864,21 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
             run_outer_loop([&](const OuterloopArgs &args) {
                 // Copy Q into k["buffer idx of the 1st block"+1]
                 // NOTE. As we reach here, we must have already issued the last O gemm of the last round, which means that the penultimate O gemm must be finished (since the last O gemm |-> bar_so_ready (the last S is ready) |-> the penultimate O gemm must be finished). So the corresponding K buffer must be free.
+#if FLASH_MLA_TARGET == 107
+                // For the RoPE part, Q RoPE has its own slot. The last round's UTCCP from it is done: the commit for that round's last P, issued after it, was waited on before the last S became ready.
+#else
                 // For the RoPE part, as we reach here, the last S from the last round must be ready, which means that the corresponding K RoPE buffer must be free.
+#endif
                 int q_slot_idx = rs.offset_by(+1).get<NUM_BUFS>().first;
                 issue_q_rope_tma(args.s_q_idx);
                 issue_q_nope_tma(args.s_q_idx, q_slot_idx);
                 issue_q_rope_utccp(args.outer_loop_phase);
                 issue_q_nope_utccp(args.outer_loop_phase, q_slot_idx);
+#if FLASH_MLA_TARGET == 107
+                // NOTE Nothing waits for Q RoPE's UTCCP: K RoPE tiles go to their own slots, not Q RoPE's
+#else
                 // NOTE Here we don't need to wait for bar_prologue_utccp_rope, since the copy-in of the first RoPE relies on bar_prologue_utccp_rope
+#endif
 
                 CUTE_NO_UNROLL
                 for (int k = 0; k < args.num_k_blocks+1; ++k) {
@@ -719,10 +895,19 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                         // Wait for K (RoPE)
                         // P = Q(rope) @ K(rope)^T
                         if constexpr (HAVE_ROPE) {
+#if FLASH_MLA_TARGET == 107
+                            auto [rope_idx, rope_phase] = rs.get<NUM_ROPE_BUFS>();
+                            Tensor sK_rope_cur = make_tensor(make_smem_ptr(plan.qk_rope_slot + rope_idx*(B_TOPK*(D_Q-D_V))), SmemLayoutKRoPE_TiledMMA{});
+                            plan.bar_kv_rope_ready[rope_idx].wait(rope_phase);
+                            ku::tcgen05_after_thread_sync();
+                            ku::utcmma_ts(tiled_mma_P, tQ_rope, sK_rope_cur, tP, true);
+                            ku::umma_arrive_noelect(plan.bar_qk_rope_done[rope_idx]);
+#else
                             plan.bar_kv_rope_ready.wait(binary_bar_phase);
                             ku::tcgen05_after_thread_sync();
                             ku::utcmma_ts(tiled_mma_P, tQ_rope, sK_rope, tP, true);
                             ku::umma_arrive_noelect(plan.bar_qk_rope_done);
+#endif
                         }
 
                         // Wait for K (NoPE)
@@ -767,15 +952,16 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
             // KV valid loading + CLC producer warp
             if (lane_idx < B_TOPK/8) {
                 run_outer_loop([&](const OuterloopArgs &args) {
-                    int* gIndices = params.indices + args.s_q_idx*params.stride_indices_s_q; // [topk]
+                    KvTileSource<B_TOPK, HAVE_TOPK_LENGTH> kv_tiles(params, args.s_q_idx, args.topk_length);
                     CUTE_NO_UNROLL
                     for (int k = 0; k < args.num_k_blocks; ++k) {
+                        KvTile kv_tile = kv_tiles.get(k);
                         char k_validness_mask = load_indices_and_generate_mask(
                             lane_idx,
-                            gIndices + k*B_TOPK,
-                            params.s_kv,
-                            k*B_TOPK,
-                            args.topk_length
+                            kv_tile.indices,
+                            kv_tile.s_kv,
+                            kv_tile.pos_start,
+                            kv_tile.topk_length
                         );
 
                         auto [buf_idx, bar_phase] = rs.get<NUM_BUFS>();
@@ -805,15 +991,44 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                 int group_idx = thread_idx / GROUP_SIZE, idx_in_group = thread_idx % GROUP_SIZE;
                 Tensor sK_rope = make_tensor(make_smem_ptr(plan.qk_rope_slot), SmemLayoutKRoPE{});
                 bf16* sK_rope_base = &sK_rope(group_idx, idx_in_group*8);
+#if FLASH_MLA_TARGET == 107
+                // Q RoPE has its own slot, so the first K RoPE load of a job need not wait for its UTCCP
                 run_outer_loop([&](const OuterloopArgs &args) {
-                    int* gIndices = params.indices + args.s_q_idx*params.stride_indices_s_q; // [topk]
+                    KvTileSource<B_TOPK, HAVE_TOPK_LENGTH> kv_tiles(params, args.s_q_idx, args.topk_length);
                     CUTE_NO_UNROLL
                     for (int k = 0; k < args.num_k_blocks; ++k) {
+                        KvTile kv_tile = kv_tiles.get(k);
+                        auto [rope_idx, rope_phase] = rs.get<NUM_ROPE_BUFS>();
+                        bf16* sK_rope_slot_base = sK_rope_base + rope_idx*(B_TOPK*(D_Q-D_V));
+                        int indices[ROWS_PER_THREAD];
+                        CUTE_UNROLL
+                        for (int local_row = 0; local_row < ROWS_PER_THREAD; ++local_row)
+                            indices[local_row] = __ldg(kv_tile.indices + group_idx + local_row*NUM_GROUPS);
+                        plan.bar_qk_rope_done[rope_idx].wait(rope_phase^1);
+                        CUTE_UNROLL
+                        for (int local_row = 0; local_row < ROWS_PER_THREAD; ++local_row) {
+                            int index = indices[local_row];
+                            ku::cp_async_cacheglobal<ku::PrefetchSize::B128>(
+                                kv_tile.kv + (int64_t)index*kv_tile.stride_kv + 512 + idx_in_group*8,
+                                sK_rope_slot_base + local_row*NUM_GROUPS*32,
+                                index >= 0 && index < kv_tile.s_kv
+                            );
+                        }
+                        cutlass::arch::cpasync_barrier_arrive_noinc((uint64_t*)&(plan.bar_kv_rope_ready[rope_idx]));
+                        rs.update();
+                    }
+                });
+#else
+                run_outer_loop([&](const OuterloopArgs &args) {
+                    KvTileSource<B_TOPK, HAVE_TOPK_LENGTH> kv_tiles(params, args.s_q_idx, args.topk_length);
+                    CUTE_NO_UNROLL
+                    for (int k = 0; k < args.num_k_blocks; ++k) {
+                        KvTile kv_tile = kv_tiles.get(k);
                         auto [_, binary_bar_phase] = rs.get<1>();
                         int indices[ROWS_PER_THREAD];
                         CUTE_UNROLL
                         for (int local_row = 0; local_row < ROWS_PER_THREAD; ++local_row)
-                            indices[local_row] = __ldg(gIndices + k*B_TOPK + group_idx + local_row*NUM_GROUPS);
+                            indices[local_row] = __ldg(kv_tile.indices + group_idx + local_row*NUM_GROUPS);
                         plan.bar_qk_rope_done.wait(binary_bar_phase^1);
                         if (k == 0) {
                             plan.bar_prologue_utccp_rope.wait(args.outer_loop_phase); // Wait for Q RoPE's UTCCP so that qk_rope_slot is empty
@@ -822,9 +1037,9 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                         for (int local_row = 0; local_row < ROWS_PER_THREAD; ++local_row) {
                             int index = indices[local_row];
                             ku::cp_async_cacheglobal<ku::PrefetchSize::B128>(
-                                params.kv + (int64_t)index*params.stride_kv_s_kv + 512 + idx_in_group*8,
+                                kv_tile.kv + (int64_t)index*kv_tile.stride_kv + 512 + idx_in_group*8,
                                 sK_rope_base + local_row*NUM_GROUPS*32,
-                                index >= 0 && index < params.s_kv
+                                index >= 0 && index < kv_tile.s_kv
                             );  // NOTE Using cp.async instead of TMA is faster here
                             // NOTE Here we only consider the range of `index` instead of also checking against topk_length, as it's noted that under this scenario (i.e. there exists a valid index among indices[topk_length: ] that points to a token who has NaN inside)
                         }
@@ -832,6 +1047,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                         rs.update();
                     }
                 });
+#endif
             }
         }
     }
@@ -845,23 +1061,26 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
 
 template<typename Kernel, typename TmaParams>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, 1)
-#if FLASH_MLA_SMALL_HEADS
-sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnSmallHeadsFwdParams params, __grid_constant__ const TmaParams tma_params) {
-#else // FLASH_MLA_SMALL_HEADS
-sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __grid_constant__ const TmaParams tma_params) {
-#endif // FLASH_MLA_SMALL_HEADS
+sparse_attn_fwd_kernel(__grid_constant__ const KernelParams params, __grid_constant__ const TmaParams tma_params) {
+#if FLASH_MLA_TARGET == 107 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 1070
+    // Never launched: can_use_oversized_smem() requires the device to run this file's sm_107 code. __CUDA_ARCH__
+    // (not a CUTLASS feature macro) selects the passes: every sm_107 pass compiles the body, any other traps.
+    __trap();
+#else
     Kernel::sparse_attn_fwd_kernel_devfunc(params, tma_params);
+#endif
 }
 
-template<FwdMode FWD_MODE, int D_QK>
-#if FLASH_MLA_SMALL_HEADS
-void KernelTemplate<FWD_MODE, D_QK>::run(const SparseAttnSmallHeadsFwdParams& params) {
-#else // FLASH_MLA_SMALL_HEADS
-void KernelTemplate<FWD_MODE, D_QK>::run(const SparseAttnFwdParams& params) {
-#endif // FLASH_MLA_SMALL_HEADS
+template<FwdMode FWD_MODE, int D_QK, bool HAVE_TOPK_LENGTH_>
+void KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::run(const KernelParams& params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % B_TOPK == 0);   // To save some boundry checkings
     KU_ASSERT(params.topk >= 128);  // To simplify synchronizations between outer loop boundries
+#if FLASH_MLA_EXTRA_KV
+    // A tile never straddles the two caches, and the extra cache keeps the main cache's limits
+    KU_ASSERT(params.extra_topk % B_TOPK == 0);
+    KU_ASSERT(params.extra_topk >= 128);
+#endif
     KU_ASSERT(params.h_q == 64);
     KU_ASSERT(params.d_qk == D_QK);
     static_assert(D_QK == 576 || D_QK == 512);
@@ -913,29 +1132,6 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const SparseAttnFwdParams& params) {
         SmemLayoutOTiles<1>{}
     );
 
-    CUtensorMap tensor_map_kv_nope;
-    {
-        uint64_t size[2] = {D_V, (unsigned long)params.s_kv};
-        uint64_t stride[1] = {params.stride_kv_s_kv*sizeof(bf16)};
-        uint32_t box_size[2] = {64, 1};
-        uint32_t elem_stride[2] = {1, 1};
-        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
-            &tensor_map_kv_nope,
-            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-            2,
-            params.kv,
-            size,
-            stride,
-            box_size,
-            elem_stride,
-            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-        );
-        KU_ASSERT(res == CUresult::CUDA_SUCCESS);
-    }
-
     TmaParams<
         decltype(shape_Q_nope), decltype(tma_Q_nope),
         decltype(shape_Q_rope), decltype(tma_Q_rope),
@@ -944,24 +1140,108 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const SparseAttnFwdParams& params) {
         shape_Q_nope, tma_Q_nope,
         shape_Q_rope, tma_Q_rope,
         shape_O, tma_O,
-        tensor_map_kv_nope
+        make_kv_nope_tensor_map(params.kv, params.s_kv, params.stride_kv_s_kv, D_V),
+#if FLASH_MLA_EXTRA_KV
+        make_kv_nope_tensor_map(params.extra_kv, params.extra_s_kv, params.stride_extra_kv_s_kv, D_V),
+#endif
     };
-    auto kernel = &sparse_attn_fwd_kernel<KernelTemplate<FWD_MODE, D_QK>, decltype(tma_params)>;
+    auto kernel = &sparse_attn_fwd_kernel<KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+#if FLASH_MLA_TARGET == 107
+#if CUDART_VERSION >= 13040
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeSharedMemoryMode;
+    attrs[0].val.sharedMemoryMode = cudaSharedMemoryModeAllowOversizedSharedMemory;
+    cudaLaunchConfig_t launch_config = {};
+    launch_config.gridDim = dim3(params.s_q, 1, 1);
+    launch_config.blockDim = dim3(NUM_THREADS, 1, 1);
+    launch_config.dynamicSmemBytes = smem_size;
+    launch_config.stream = params.stream;
+    launch_config.attrs = attrs;
+    launch_config.numAttrs = 1;
+    KU_CUDA_CHECK(cudaLaunchKernelEx(&launch_config, kernel, params, tma_params));
+#else
+    KU_ASSERT(false, "Oversized shared memory requires CUDA 13.4");
+#endif
+#else
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     kernel<<<params.s_q, NUM_THREADS, smem_size, params.stream>>>(params, tma_params);
     KU_CHECK_KERNEL_LAUNCH();
+#endif
+}
+
+#if FLASH_MLA_TARGET == 107
+// Built with the same gencode list as the kernels in this file, so the driver picks the same binary for it
+template<int UNUSED>
+__global__ void sm107_binary_probe_kernel() {}
+
+template<FwdMode FWD_MODE, int D_QK, bool HAVE_TOPK_LENGTH_>
+bool KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::can_use_oversized_smem() {
+#if CUDART_VERSION >= 13040
+    // As core_attn does: use this copy only when the device runs its sm_107 binary, not other (e.g. family) code
+    auto probe = [](int device) -> bool {
+        const char *disable = std::getenv("FLASH_MLA_DISABLE_OVERSIZED_SMEM");
+        if (disable != nullptr && std::strcmp(disable, "1") == 0) {
+            return false;
+        }
+        int max_oversized_smem = 0;
+        if (cudaDeviceGetAttribute(&max_oversized_smem, cudaDevAttrOversizedSharedMemoryPerBlock, device) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return false;
+        }
+        if ((size_t)max_oversized_smem < sizeof(SharedMemoryPlan)) {
+            return false;
+        }
+        cudaFuncAttributes func_attrs;
+        if (cudaFuncGetAttributes(&func_attrs, &sm107_binary_probe_kernel<0>) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return false;
+        }
+        return func_attrs.binaryVersion == 107;
+    };
+    static constexpr int MAX_DEVICES = 16;
+    static std::once_flag probed[MAX_DEVICES];
+    static char supported[MAX_DEVICES];
+    int device = 0;
+    KU_CUDA_CHECK(cudaGetDevice(&device));
+    if (device >= MAX_DEVICES) {
+        return false;
+    }
+    std::call_once(probed[device], [&] { supported[device] = probe(device) ? 1 : 0; });
+    return supported[device] != 0;
+#else
+    return false;
+#endif
+}
+#else
+template<FwdMode FWD_MODE, int D_QK, bool HAVE_TOPK_LENGTH>
+void run_sparse_fwd_phase1_variant(const KernelParams& params) {
+    // The sm_107 copy (small_heads_sm107 or head64_sm107, a sibling namespace) is included first by the wrapper
+#if FLASH_MLA_SMALL_HEADS
+    using KernelSm107 = small_heads_sm107::KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH>;
+#else
+    using KernelSm107 = head64_sm107::KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH>;
+#endif
+    if (KernelSm107::can_use_oversized_smem()) {
+        KernelSm107::run(params);
+        return;
+    }
+    KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH>::run(params);
 }
 
 template<FwdMode FWD_MODE, int D_QK>
-#if FLASH_MLA_SMALL_HEADS
-void run_sparse_fwd_phase1_kernel(const SparseAttnSmallHeadsFwdParams& params) {
-#else // FLASH_MLA_SMALL_HEADS
-void run_sparse_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
-#endif // FLASH_MLA_SMALL_HEADS
-    KernelTemplate<FWD_MODE, D_QK>::run(params);
+void run_sparse_fwd_phase1_kernel(const KernelParams& params) {
+#if FLASH_MLA_EXTRA_KV
+    // Per-query lengths are compiled in only when given, so calls without them run the code without them
+    if (params.topk_length != nullptr || params.extra_topk_length != nullptr) {
+        run_sparse_fwd_phase1_variant<FWD_MODE, D_QK, true>(params);
+        return;
+    }
+#endif
+    run_sparse_fwd_phase1_variant<FWD_MODE, D_QK, false>(params);
 }
+#endif
 
 }

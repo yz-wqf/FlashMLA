@@ -1,4 +1,10 @@
 // Shared M64 .ws pipeline; specialized locally by each wrapper.
+// Wrappers set FLASH_MLA_SMALL_HEADS (0/1) and may set FLASH_MLA_EXTRA_KV (1) before
+// including this file and phase1.cuh, and #undef both afterwards.
+// FLASH_MLA_TARGET == 107 selects the sm_107 copy (namespaces *_sm107): 4 KV slots and 2 K RoPE slots in oversized
+// shared memory, small buffers below the KV slots. Compiled for sm_107a / sm_107f only.
+
+#include <cstddef>
 
 #include <cute/tensor.hpp>
 #include <kerutils/kerutils.cuh>
@@ -6,16 +12,40 @@
 #include "kernels/defines.h"
 #include "kernels/params.h"
 
-#if FLASH_MLA_SMALL_HEADS
+#if FLASH_MLA_EXTRA_KV && FLASH_MLA_SMALL_HEADS && FLASH_MLA_TARGET == 107
+namespace legacy::sm100::prefill::sparse_fwd::extra_kv::small_heads_sm107 {
+#elif FLASH_MLA_EXTRA_KV && FLASH_MLA_SMALL_HEADS
+namespace legacy::sm100::prefill::sparse_fwd::extra_kv::small_heads {
+#elif FLASH_MLA_EXTRA_KV && FLASH_MLA_TARGET == 107
+namespace legacy::sm100::prefill::sparse_fwd::extra_kv::head64_sm107 {
+#elif FLASH_MLA_EXTRA_KV
+namespace legacy::sm100::prefill::sparse_fwd::extra_kv::head64 {
+#elif FLASH_MLA_SMALL_HEADS && FLASH_MLA_TARGET == 107
+namespace legacy::sm100::prefill::sparse_fwd::small_heads_sm107 {
+#elif FLASH_MLA_SMALL_HEADS
 namespace legacy::sm100::prefill::sparse_fwd::small_heads {
-#else // FLASH_MLA_SMALL_HEADS
+#elif FLASH_MLA_TARGET == 107
+namespace legacy::sm100::prefill::sparse_fwd::head64_sm107 {
+#else
 namespace legacy::sm100::prefill::sparse_fwd::head64 {
-#endif // FLASH_MLA_SMALL_HEADS
+#endif
 
 using namespace cute;
 
-template<SparseAttnFwdMode FWD_MODE, int D_QK>
+#if FLASH_MLA_EXTRA_KV
+using KernelParams = SparseAttnExtraKvFwdParams;
+#elif FLASH_MLA_SMALL_HEADS
+using KernelParams = SparseAttnSmallHeadsFwdParams;
+#else
+using KernelParams = SparseAttnFwdParams;
+#endif
+
+// HAVE_TOPK_LENGTH_ (extra KV cache only): topk_length or extra_topk_length is set, so whole tiles past either
+// length are skipped. Without it the kernel covers every tile of both caches, with no per-query length handling.
+template<SparseAttnFwdMode FWD_MODE, int D_QK, bool HAVE_TOPK_LENGTH_ = false>
 struct KernelTemplate {
+
+static constexpr bool HAVE_TOPK_LENGTH = HAVE_TOPK_LENGTH_;
 
 static constexpr uint32_t B_H = 64;   // Head block size. This kernel only supports h_q == B_H
 
@@ -29,6 +59,9 @@ struct TmaParams {
     Shape_Q_RoPE shape_Q_rope; TMA_Q_RoPE tma_Q_rope;
     Shape_O shape_O; TMA_O tma_O;
     CUtensorMap tensor_map_kv_nope;
+#if FLASH_MLA_EXTRA_KV
+    CUtensorMap tensor_map_extra_kv_nope;
+#endif
 };
 
 static_assert(D_QK == 576 || D_QK == 512);
@@ -42,7 +75,13 @@ static constexpr int D_ROPE = D_QK - D_V;
 static constexpr bool HAVE_ROPE = D_ROPE > 0;
 
 static constexpr int B_TOPK = 64;
+#if FLASH_MLA_TARGET == 107
+static constexpr int NUM_BUFS = 4;
+static constexpr int NUM_ROPE_BUFS = 2;
+static constexpr uint32_t OVERSIZED_SMEM_CAPACITY = 334848;
+#else
 static constexpr int NUM_BUFS = 3;
+#endif
 #if FLASH_MLA_SMALL_HEADS
 static constexpr int NUM_THREADS = HAVE_ROPE ? 320 : 256;
 static constexpr int NUM_WORKER_THREADS = 64 + 128 + 1 + B_TOPK/8+1 + (HAVE_ROPE?64:0);
@@ -127,6 +166,34 @@ using SmemLayoutS = decltype(coalesce(tile_to_shape(
 	Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
+#if FLASH_MLA_TARGET == 107
+struct SharedMemoryPlan {
+    bf16 qk_rope_slot[NUM_ROPE_BUFS*B_TOPK*(D_Q-D_V)];  // K RoPE slots, B_TOPK*(D_Q-D_V) apart
+    bf16 q_rope_slot[B_H*(D_Q-D_V)];
+    float p_exchange_buf[4][32 * (B_TOPK/(128/B_H))];
+    bf16 s[B_H*B_TOPK];
+    union {
+        static_assert(B_H <= B_TOPK);
+        array_aligned<bf16, B_TOPK*D_V> qko_slots[NUM_BUFS];
+    } u;
+    char is_k_valid[NUM_BUFS][B_TOPK/8];
+    transac_bar_t bar_prologue_q_nope, bar_prologue_q_rope, bar_prologue_utccp_nope, bar_prologue_utccp_rope;
+    transac_bar_t bar_qk_nope_done[NUM_BUFS], bar_qk_rope_done[NUM_ROPE_BUFS];    // Pi = QKi^T (the nope part) done
+    transac_bar_t bar_sv_done[NUM_BUFS];    // O += SiVi done (i.e. O, Si and Vi are free)
+    transac_bar_t bar_kv_nope_ready[NUM_BUFS][2], bar_kv_rope_ready[NUM_ROPE_BUFS];
+    transac_bar_t bar_p_free;
+    transac_bar_t bar_so_ready;   // S and O are ready
+    transac_bar_t bar_o_write_back_done;
+    transac_bar_t bar_o_write_back_done_waited; // Whether the barrier above has been waited for. Used to prevent double arrive
+    transac_bar_t bar_k_valid_ready[NUM_BUFS], bar_k_valid_free[NUM_BUFS];
+    transac_bar_t bar_clc_full, bar_clc_empty;
+    array_aligned<uint32_t, 1> tmem_start_addr;
+    float rowwise_max_buf[128], rowwise_li_buf[128];
+    ku::CLCResponseObj clc_response_obj;
+};
+static_assert(offsetof(SharedMemoryPlan, u) % 1024 == 0);
+static_assert(sizeof(SharedMemoryPlan) <= OVERSIZED_SMEM_CAPACITY);
+#else
 struct SharedMemoryPlan {
     union {
         static_assert(B_H <= B_TOPK);
@@ -150,6 +217,7 @@ struct SharedMemoryPlan {
     float rowwise_max_buf[128], rowwise_li_buf[128];
     ku::CLCResponseObj clc_response_obj;
 };
+#endif
 
 static constexpr int QK_MRGEMM_N = (128/B_H)*B_TOPK;
 static constexpr int QK_MRGEMM_K_NOPE = D_V / (128/B_H);
@@ -171,17 +239,14 @@ enum NamedBarriers : int {
 
 template<typename TmaParam>
 static __device__ void
-#if FLASH_MLA_SMALL_HEADS
-sparse_attn_fwd_kernel_devfunc(const SparseAttnSmallHeadsFwdParams &params, const TmaParam &tma_params);
-#else // FLASH_MLA_SMALL_HEADS
-sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params, const TmaParam &tma_params);
-#endif // FLASH_MLA_SMALL_HEADS
+sparse_attn_fwd_kernel_devfunc(const KernelParams &params, const TmaParam &tma_params);
 
-#if FLASH_MLA_SMALL_HEADS
-static void run(const SparseAttnSmallHeadsFwdParams& params);
-#else // FLASH_MLA_SMALL_HEADS
-static void run(const SparseAttnFwdParams& params);
-#endif // FLASH_MLA_SMALL_HEADS
+static void run(const KernelParams& params);
+
+#if FLASH_MLA_TARGET == 107
+// Whether the current device runs this file's sm_107 binary and has the shared memory this copy needs
+static bool can_use_oversized_smem();
+#endif
 
 };
 
